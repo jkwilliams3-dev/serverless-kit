@@ -1,0 +1,37 @@
+{
+  "name": "serverless-kit",
+  "version": "1.0.0",
+  "description": "Production-ready AWS serverless application template with React dashboard",
+  "private": true,
+  "scripts": {
+    "dev": "cd frontend && npm run dev",
+    "build": "cd frontend && npm run build",
+    "preview": "cd frontend && npm run preview",
+    "deploy": "sam deploy --config-file samconfig.toml",
+    "deploy:guided": "sam deploy --guided",
+    "deploy:dev": "sam deploy --config-env dev",
+    "deploy:prod": "sam deploy --config-env prod",
+    "local:api": "sam local start-api --env-vars env.json",
+    "local:dynamo": "docker run -p 8000:8000 amazon/dynamodb-local",
+    "seed": "bash scripts/seed-data.sh",
+    "validate": "sam validate --template infrastructure/template.yaml",
+    "lint:backend": "cd backend && npx eslint handlers/ utils/",
+    "test:backend": "cd backend && npm test",
+    "package": "sam build && sam package --s3-bucket $SAM_DEPLOY_BUCKET --output-template-file .aws-sam/packaged.yaml",
+    "logs": "sam logs -n CreateItemFunction --tail"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "aws",
+    "serverless",
+    "lambda",
+    "dynamodb",
+    "cloudformation",
+    "react",
+    "template"
+  ],
+  "author": "Jonathan Williams",
+  "license": "MIT"
+}

@@ -1,0 +1,19 @@
+{
+  "name": "serverless-kit-backend",
+  "version": "1.0.0",
+  "description": "Lambda handler functions for ServerlessKit",
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.600.0",
+    "@aws-sdk/lib-dynamodb": "^3.600.0",
+    "uuid": "^9.0.1"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "@types/aws-lambda": "^8.10.140"
+  },
+  "scripts": {
+    "test": "jest",
+    "test:watch": "jest --watch"
+  }
+}

@@ -1,0 +1,692 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+
+Description: >
+  ServerlessKit — Production-ready AWS serverless application template.
+  Includes Lambda, DynamoDB, API Gateway, Cognito, CloudFront, S3, and CloudWatch.
+  Deploy with: sam deploy --guided
+
+# ============================================================
+# PARAMETERS — Override at deploy time via samconfig.toml
+# ============================================================
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment (affects resource naming and retention)
+
+  ProjectName:
+    Type: String
+    Default: serverless-kit
+    Description: Used as a prefix for all resource names
+
+  CorsOrigin:
+    Type: String
+    Default: "*"
+    Description: Allowed CORS origin for API Gateway (use specific domain in prod)
+
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365]
+    Description: Number of days to retain CloudWatch logs
+
+# ============================================================
+# GLOBALS — Shared settings applied to all Lambda functions
+# ============================================================
+Globals:
+  Function:
+    Runtime: nodejs18.x
+    Timeout: 30
+    MemorySize: 256
+    # Environment variables available in every Lambda handler
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref ItemsTable
+        ENVIRONMENT: !Ref Environment
+        CORS_ORIGIN: !Ref CorsOrigin
+    # Attach the shared execution role
+    Role: !GetAtt LambdaExecutionRole.Arn
+    # Enable X-Ray tracing for all functions
+    Tracing: Active
+    Layers:
+      - !Ref DependenciesLayer
+
+  Api:
+    # Enable CORS globally on all API routes
+    Cors:
+      AllowMethods: "'GET,POST,PUT,DELETE,OPTIONS'"
+      AllowHeaders: "'Content-Type,Authorization,X-Amz-Date,X-Api-Key'"
+      AllowOrigin: !Sub "'${CorsOrigin}'"
+
+# ============================================================
+# RESOURCES
+# ============================================================
+Resources:
+
+  # ----------------------------------------------------------
+  # LAMBDA LAYER — Shared dependencies (aws-sdk, etc.)
+  # ----------------------------------------------------------
+  DependenciesLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub "${ProjectName}-dependencies-${Environment}"
+      Description: Shared Node.js dependencies for all Lambda functions
+      ContentUri: ../backend/layer/
+      CompatibleRuntimes:
+        - nodejs18.x
+      RetentionPolicy: Delete
+
+  # ----------------------------------------------------------
+  # DYNAMODB TABLE — Single-table design with GSI
+  # ----------------------------------------------------------
+  ItemsTable:
+    Type: AWS::DynamoDB::Table
+    # DeletionPolicy: Retain ensures data survives stack deletion in prod
+    DeletionPolicy: !If [IsProd, Retain, Delete]
+    Properties:
+      TableName: !Sub "${ProjectName}-items-${Environment}"
+      BillingMode: PAY_PER_REQUEST   # On-demand pricing — scales automatically
+      # Primary key: partition key (pk) + sort key (sk) for flexibility
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+        - AttributeName: gsi1pk
+          AttributeType: S
+        - AttributeName: gsi1sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      # GSI1 — allows querying items by status/category
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1
+          KeySchema:
+            - AttributeName: gsi1pk
+              KeyType: HASH
+            - AttributeName: gsi1sk
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      # Enable point-in-time recovery in production
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProd, true, false]
+      # Encrypt table data at rest using AWS managed key
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ----------------------------------------------------------
+  # IAM ROLE — Least-privilege execution role for Lambda
+  # ----------------------------------------------------------
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-lambda-role-${Environment}"
+      # Trust policy: only Lambda service can assume this role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # Basic execution: write logs to CloudWatch
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        # X-Ray: send trace segments
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: DynamoDBCRUD
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:BatchGetItem
+                # Scope access to only the items table and its indexes
+                Resource:
+                  - !GetAtt ItemsTable.Arn
+                  - !Sub "${ItemsTable.Arn}/index/*"
+
+  # ----------------------------------------------------------
+  # API GATEWAY — REST API with Cognito authorizer
+  # ----------------------------------------------------------
+  ApiGateway:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub "${ProjectName}-api-${Environment}"
+      StageName: !Ref Environment
+      # Attach Cognito User Pool as the authorizer
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        AddDefaultAuthorizerToCorsPreflight: false
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt UserPool.Arn
+            Identity:
+              Header: Authorization
+      # Enable access logging for API Gateway
+      AccessLogSetting:
+        DestinationArn: !GetAtt ApiGatewayLogGroup.Arn
+        Format: >
+          {"requestId":"$context.requestId","ip":"$context.identity.sourceIp",
+          "caller":"$context.identity.caller","user":"$context.identity.user",
+          "requestTime":"$context.requestTime","httpMethod":"$context.httpMethod",
+          "resourcePath":"$context.resourcePath","status":"$context.status",
+          "protocol":"$context.protocol","responseLength":"$context.responseLength",
+          "integrationLatency":"$context.integrationLatency","latency":"$context.responseLatency"}
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          # Enable detailed CloudWatch metrics per route
+          MetricsEnabled: true
+          DataTraceEnabled: !If [IsNotProd, true, false]
+          ThrottlingBurstLimit: 100
+          ThrottlingRateLimit: 50
+      Tags:
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+
+  ApiGatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/apigateway/${ProjectName}-${Environment}"
+      RetentionInDays: !Ref LogRetentionDays
+
+  # ----------------------------------------------------------
+  # COGNITO — User Pool for authentication
+  # ----------------------------------------------------------
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    DeletionPolicy: !If [IsProd, Retain, Delete]
+    Properties:
+      UserPoolName: !Sub "${ProjectName}-users-${Environment}"
+      # Self-service sign-up (disable in prod if invite-only)
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: false
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+      # JWT token validity settings
+      UserPoolAddOns:
+        AdvancedSecurityMode: !If [IsProd, ENFORCED, "OFF"]
+      Schema:
+        - Name: email
+          Required: true
+          Mutable: false
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub "${ProjectName}-client-${Environment}"
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false   # No secret — SPA uses PKCE flow
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_PASSWORD_AUTH
+      # Token expiry settings
+      AccessTokenValidity: 1       # hours
+      IdTokenValidity: 1           # hours
+      RefreshTokenValidity: 30     # days
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+      # Allowed OAuth flows for hosted UI
+      AllowedOAuthFlows:
+        - code
+      AllowedOAuthScopes:
+        - openid
+        - email
+        - profile
+      CallbackURLs:
+        - !Sub "https://${CloudFrontDistribution.DomainName}/callback"
+        - "http://localhost:5173/callback"   # Vite dev server
+      LogoutURLs:
+        - !Sub "https://${CloudFrontDistribution.DomainName}"
+        - "http://localhost:5173"
+      SupportedIdentityProviders:
+        - COGNITO
+
+  # ----------------------------------------------------------
+  # LAMBDA FUNCTIONS — CRUD handlers
+  # ----------------------------------------------------------
+
+  CreateItemFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-create-item-${Environment}"
+      CodeUri: ../backend/handlers/
+      Handler: createItem.handler
+      Description: POST /items — creates a new item in DynamoDB
+      Events:
+        CreateItem:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /items
+            Method: POST
+      # Log group with controlled retention
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2020
+        EntryPoints: [createItem.js]
+
+  CreateItemLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-create-item-${Environment}"
+      RetentionInDays: !Ref LogRetentionDays
+
+  GetItemFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-get-item-${Environment}"
+      CodeUri: ../backend/handlers/
+      Handler: getItem.handler
+      Description: GET /items/:id — retrieves a single item from DynamoDB
+      Events:
+        GetItem:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /items/{id}
+            Method: GET
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2020
+        EntryPoints: [getItem.js]
+
+  GetItemLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-get-item-${Environment}"
+      RetentionInDays: !Ref LogRetentionDays
+
+  ListItemsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-list-items-${Environment}"
+      CodeUri: ../backend/handlers/
+      Handler: listItems.handler
+      Description: GET /items — lists items with pagination and filtering
+      Events:
+        ListItems:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /items
+            Method: GET
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2020
+        EntryPoints: [listItems.js]
+
+  ListItemsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-list-items-${Environment}"
+      RetentionInDays: !Ref LogRetentionDays
+
+  UpdateItemFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-update-item-${Environment}"
+      CodeUri: ../backend/handlers/
+      Handler: updateItem.handler
+      Description: PUT /items/:id — updates an existing item
+      Events:
+        UpdateItem:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /items/{id}
+            Method: PUT
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2020
+        EntryPoints: [updateItem.js]
+
+  UpdateItemLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-update-item-${Environment}"
+      RetentionInDays: !Ref LogRetentionDays
+
+  DeleteItemFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-delete-item-${Environment}"
+      CodeUri: ../backend/handlers/
+      Handler: deleteItem.handler
+      Description: DELETE /items/:id — soft-deletes an item
+      Events:
+        DeleteItem:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /items/{id}
+            Method: DELETE
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2020
+        EntryPoints: [deleteItem.js]
+
+  DeleteItemLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-delete-item-${Environment}"
+      RetentionInDays: !Ref LogRetentionDays
+
+  # ----------------------------------------------------------
+  # S3 BUCKET — Static website hosting for React frontend
+  # ----------------------------------------------------------
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub "${ProjectName}-frontend-${Environment}-${AWS::AccountId}"
+      # Block all public access — CloudFront uses OAC instead
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      # Encrypt objects at rest
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      # Remove old versions and non-current objects to control costs
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # S3 bucket policy — grants CloudFront OAC read access only
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Statement:
+          - Sid: AllowCloudFrontOAC
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${FrontendBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                # Only allow requests from our specific CloudFront distribution
+                "AWS:SourceArn": !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}"
+
+  # ----------------------------------------------------------
+  # CLOUDFRONT — CDN for frontend, SSL termination
+  # ----------------------------------------------------------
+  CloudFrontOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${ProjectName}-oac-${Environment}"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub "${ProjectName} frontend distribution (${Environment})"
+        Enabled: true
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        # Default root object for SPA
+        DefaultRootObject: index.html
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt CloudFrontOAC.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""   # Empty — using OAC not legacy OAI
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6  # CachingOptimized
+          OriginRequestPolicyId: 88a5eaf4-2fd4-4709-b370-b4c650ea3fcf
+          # Compress assets for faster delivery
+          Compress: true
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD]
+        # SPA routing: return index.html for 404s (React Router handles routing)
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 10
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 10
+        # Security headers via CloudFront response headers policy
+        PriceClass: PriceClass_100  # Use only US/Europe/Asia edge locations
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ----------------------------------------------------------
+  # CLOUDWATCH — Alarms for production monitoring
+  # ----------------------------------------------------------
+
+  # Alarm: Lambda error rate > 5% over 5 minutes
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-lambda-errors-${Environment}"
+      AlarmDescription: Lambda functions are returning errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref CreateItemFunction
+
+  # Alarm: DynamoDB throttled requests
+  DynamoThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-dynamo-throttles-${Environment}"
+      AlarmDescription: DynamoDB is throttling requests — consider provisioned capacity
+      MetricName: ThrottledRequests
+      Namespace: AWS/DynamoDB
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: TableName
+          Value: !Ref ItemsTable
+
+  # Alarm: API Gateway 5xx errors
+  ApiGateway5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-api-5xx-${Environment}"
+      AlarmDescription: API Gateway is returning 5xx errors
+      MetricName: 5XXError
+      Namespace: AWS/ApiGateway
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: ApiName
+          Value: !Sub "${ProjectName}-api-${Environment}"
+
+  # CloudWatch Dashboard — operational overview
+  OperationsDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "${ProjectName}-${Environment}"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "properties": {
+                "title": "Lambda Invocations & Errors",
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${CreateItemFunction}"],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${CreateItemFunction}"],
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${ListItemsFunction}"],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${ListItemsFunction}"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric",
+              "properties": {
+                "title": "Lambda Duration (P99)",
+                "metrics": [
+                  ["AWS/Lambda", "Duration", "FunctionName", "${CreateItemFunction}", {"stat": "p99"}],
+                  ["AWS/Lambda", "Duration", "FunctionName", "${ListItemsFunction}", {"stat": "p99"}]
+                ],
+                "period": 300,
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric",
+              "properties": {
+                "title": "API Gateway Requests",
+                "metrics": [
+                  ["AWS/ApiGateway", "Count", "ApiName", "${ProjectName}-api-${Environment}"],
+                  ["AWS/ApiGateway", "5XXError", "ApiName", "${ProjectName}-api-${Environment}"],
+                  ["AWS/ApiGateway", "4XXError", "ApiName", "${ProjectName}-api-${Environment}"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric",
+              "properties": {
+                "title": "DynamoDB Consumed Capacity",
+                "metrics": [
+                  ["AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", "${ItemsTable}"],
+                  ["AWS/DynamoDB", "ConsumedWriteCapacityUnits", "TableName", "${ItemsTable}"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "view": "timeSeries"
+              }
+            }
+          ]
+        }
+
+# ============================================================
+# CONDITIONS
+# ============================================================
+Conditions:
+  IsProd: !Equals [!Ref Environment, prod]
+  IsNotProd: !Not [!Equals [!Ref Environment, prod]]
+
+# ============================================================
+# OUTPUTS — Values exported for cross-stack references
+# ============================================================
+Outputs:
+  ApiUrl:
+    Description: API Gateway base URL
+    Value: !Sub "https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Environment}"
+    Export:
+      Name: !Sub "${ProjectName}-api-url-${Environment}"
+
+  FrontendUrl:
+    Description: CloudFront distribution URL
+    Value: !Sub "https://${CloudFrontDistribution.DomainName}"
+    Export:
+      Name: !Sub "${ProjectName}-frontend-url-${Environment}"
+
+  FrontendBucketName:
+    Description: S3 bucket name for frontend deployment
+    Value: !Ref FrontendBucket
+    Export:
+      Name: !Sub "${ProjectName}-frontend-bucket-${Environment}"
+
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref UserPool
+    Export:
+      Name: !Sub "${ProjectName}-user-pool-id-${Environment}"
+
+  UserPoolClientId:
+    Description: Cognito User Pool Client ID
+    Value: !Ref UserPoolClient
+    Export:
+      Name: !Sub "${ProjectName}-user-pool-client-id-${Environment}"
+
+  TableName:
+    Description: DynamoDB table name
+    Value: !Ref ItemsTable
+    Export:
+      Name: !Sub "${ProjectName}-table-name-${Environment}"
+
+  DashboardUrl:
+    Description: CloudWatch dashboard URL
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home#dashboards:name=${ProjectName}-${Environment}"

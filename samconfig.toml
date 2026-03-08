@@ -1,0 +1,63 @@
+# SAM CLI configuration file
+# Run `sam deploy --guided` once to generate this file, or use as-is with the
+# values below. Edit the s3_bucket value to your deployment bucket.
+# Docs: https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/serverless-sam-cli-config.html
+
+version = 0.1
+
+# ────────────────────────────────────────────
+# DEFAULT (dev) environment
+# ────────────────────────────────────────────
+[default.global.parameters]
+stack_name = "serverless-kit-dev"
+
+[default.build.parameters]
+cached = true
+parallel = true
+
+[default.deploy.parameters]
+capabilities            = "CAPABILITY_NAMED_IAM"
+confirm_changeset       = true
+resolve_s3              = true
+s3_prefix               = "serverless-kit"
+region                  = "us-east-1"
+image_repositories      = []
+parameter_overrides     = "Environment=dev ProjectName=serverless-kit"
+
+[default.sync.parameters]
+watch = true
+
+[default.local_start_api.parameters]
+warm_containers = "EAGER"
+
+[default.validate.parameters]
+lint = true
+
+# ────────────────────────────────────────────
+# STAGING environment
+# ────────────────────────────────────────────
+[staging.global.parameters]
+stack_name = "serverless-kit-staging"
+
+[staging.deploy.parameters]
+capabilities            = "CAPABILITY_NAMED_IAM"
+confirm_changeset       = true
+resolve_s3              = true
+s3_prefix               = "serverless-kit"
+region                  = "us-east-1"
+parameter_overrides     = "Environment=staging ProjectName=serverless-kit"
+
+# ────────────────────────────────────────────
+# PRODUCTION environment
+# ────────────────────────────────────────────
+[prod.global.parameters]
+stack_name = "serverless-kit-prod"
+
+[prod.deploy.parameters]
+capabilities            = "CAPABILITY_NAMED_IAM"
+confirm_changeset       = true
+resolve_s3              = true
+s3_prefix               = "serverless-kit"
+region                  = "us-east-1"
+# IMPORTANT: CorsOrigin should be set to your actual domain in production
+parameter_overrides     = "Environment=prod ProjectName=serverless-kit CorsOrigin=https://yourdomain.com LogRetentionDays=90"
